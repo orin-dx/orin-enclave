@@ -1,0 +1,8 @@
+build/
+*.pem
+*.age
+*.blob
+*.sealed
+sealed-key.bin
+se-key.blob
+.DS_Store

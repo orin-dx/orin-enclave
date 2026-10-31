@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|MultiEdit|Write|NotebookEdit|Grep|Glob|LS",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash -c 'exec \"$HOME/.config/orin-dx/pr-bot-guard.sh\"'"
+          }
+        ]
+      }
+    ]
+  }
+}

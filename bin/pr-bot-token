@@ -1,0 +1,29 @@
+#!/bin/bash
+# Print a short-lived orin-dx-pr-bot installation token scoped to one repo
+# (pull_requests:write, contents:read). Thin wrapper over the Orin Enclave helper, which does all
+# the work (Touch ID, JWT, token exchange) in its own process; nothing here reads or writes secrets.
+#   pr-bot-token <repo>                 e.g. pr-bot-token callisto
+#   GH_TOKEN=$(pr-bot-token callisto) gh pr create ...
+# No environment variable changes what this runs or where it looks.
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+die() { echo "pr-bot-token: $*" >&2; exit 2; }
+
+[[ $# -eq 1 ]] || die "usage: pr-bot-token <repo>"
+repo=$1
+repo=${repo#orin-dx/}
+[[ $repo =~ ^[A-Za-z0-9._-]+$ && $repo != . && $repo != .. ]] || die "invalid repo name"
+
+# Prefer the admin-owned install (the current user cannot replace it); fall back to ~/Applications,
+# resolving the home directory from the user database rather than $HOME.
+helper="/Applications/Orin Enclave.app/Contents/MacOS/orin-enclave"
+if [[ ! -x $helper ]]; then
+  home=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')
+  [[ -n $home ]] || die "cannot determine your home directory"
+  helper="$home/Applications/Orin Enclave.app/Contents/MacOS/orin-enclave"
+fi
+[[ -x $helper ]] || die "Orin Enclave is not installed (see its README)"
+
+exec "$helper" token "$repo"

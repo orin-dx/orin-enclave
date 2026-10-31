@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash -c 'exec \"$HOME/.config/orin-dx/pr-bot-guard.sh\"'",
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

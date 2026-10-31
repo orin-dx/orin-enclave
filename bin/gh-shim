@@ -1,0 +1,258 @@
+#!/bin/bash
+# gh shim (install as ~/.local/bin/gh, ahead of Homebrew on PATH).
+#
+# `gh pr create` / `gh pr new` aimed at an orin-dx repo runs as the orin-dx-pr-bot GitHub App, so the
+# PR author is the bot and a human can approve it. Every other gh command passes straight through to
+# the real gh with your own login.
+#
+# Hardening (see tests/guard/README.md):
+#   - #!/bin/bash and a pinned PATH; ~/.local/bin is not on it, so the shim never calls itself.
+#   - No environment overrides: the real gh is /opt/homebrew/bin/gh or /usr/local/bin/gh (never a script),
+#     the mint command is <your passwd home>/.config/orin-dx/pr-bot-token (HOME is ignored), and the mint
+#     runs under `env -i`, so GH_REAL / PR_BOT_TOKEN_CMD / PR_BOT_HELPER / PR_BOT_CACHE / PATH cannot steer it.
+#   - The repo is read from -R/--repo in every form (-R x, -Rx, -R=x, --repo x, --repo=x) and every value
+#     shape (OWNER/REPO, HOST/OWNER/REPO, https://HOST/OWNER/REPO[.git], git@HOST:OWNER/REPO.git),
+#     then GH_REPO, then the checkout. If the command, GH_REPO or any git remote of the checkout mentions
+#     orin-dx, the shim takes the bot path and either opens the PR as the bot or refuses (fails closed);
+#     it never falls back to your credentials there.
+#   - `--web` is refused for orin-dx (the browser would open the PR as you). `--help` runs gh with no
+#     credentials at all, so help flags cannot smuggle a create through as you.
+#   - gh aliases and extensions (non-built-in first words) are refused inside orin-dx checkouts.
+#   - The bot token reaches gh only through the GH_TOKEN environment variable, never argv.
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+export PATH
+umask 077
+
+ORG=orin-dx
+SAFE_PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+BUILTINS=" accessibility agent-task alias api attestation auth browse cache co codespace completion config copilot extension gist gpg-key help issue label org pr preview project release repo ruleset run search secret ssh-key status variable workflow version "
+
+die() {
+  printf 'gh (orin-dx shim): %s\n' "$*" >&2
+  exit 1
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+find_real_gh() {
+  local c
+  for c in /opt/homebrew/bin/gh /usr/local/bin/gh; do
+    [[ -f $c && -x $c ]] || continue
+    # The real gh is a Mach-O binary; a script here would be another shim or a planted wrapper.
+    [[ $(head -c 2 "$c" 2>/dev/null) == '#!' ]] && continue
+    REAL=$c
+    return 0
+  done
+  return 1
+}
+
+home_dir() { # from the directory service, not $HOME
+  local u h
+  u=$(id -un) || return 1
+  [[ $u =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  h=$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null) || return 1
+  h=${h#NFSHomeDirectory: }
+  [[ $h == /* && -d $h ]] || return 1
+  HOME_DIR=$h
+  USER_NAME=$u
+}
+
+# parse_repo VALUE -> R_HOST R_OWNER R_NAME (owner/host lowercased); 1 if it is not a repo reference.
+parse_repo() {
+  local v=$1
+  v=${v%/}
+  R_HOST=github.com
+  R_OWNER=""
+  R_NAME=""
+  if [[ $v =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^/@]+@)?([^/:]+)(:[0-9]+)?/([^/]+)/([^/]+) ]]; then
+    R_HOST=${BASH_REMATCH[2]}
+    R_OWNER=${BASH_REMATCH[4]}
+    R_NAME=${BASH_REMATCH[5]}
+  elif [[ $v =~ ^[^@/:]+@([^:/]+):([^/]+)/([^/]+)$ ]]; then
+    R_HOST=${BASH_REMATCH[1]}
+    R_OWNER=${BASH_REMATCH[2]}
+    R_NAME=${BASH_REMATCH[3]}
+  elif [[ $v =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
+    R_HOST=${BASH_REMATCH[1]}
+    R_OWNER=${BASH_REMATCH[2]}
+    R_NAME=${BASH_REMATCH[3]}
+  elif [[ $v =~ ^([^/]+)/([^/]+)$ ]]; then
+    R_OWNER=${BASH_REMATCH[1]}
+    R_NAME=${BASH_REMATCH[2]}
+  else
+    return 1
+  fi
+  R_NAME=${R_NAME%.git}
+  R_HOST=$(lower "$R_HOST")
+  R_OWNER=$(lower "$R_OWNER")
+  [[ -n $R_OWNER && -n $R_NAME ]]
+}
+
+is_org() { [[ $R_OWNER == "$ORG" ]]; }
+
+# Any git remote of the current checkout on orin-dx? Sets LOCAL_NAME. No network.
+local_orin() {
+  local line url
+  LOCAL_NAME=""
+  while IFS= read -r line; do
+    url=${line#*[[:space:]]}
+    url=${url%% *}
+    if parse_repo "$url" && is_org; then
+      LOCAL_NAME=$R_NAME
+      return 0
+    fi
+  done < <(env -u GIT_DIR -u GIT_WORK_TREE git remote -v 2>/dev/null)
+  return 1
+}
+
+mentions_org() {
+  local a
+  for a in "$@"; do [[ $(lower "$a") == *"$ORG"* ]] && return 0; done
+  [[ $(lower "${GH_REPO:-}") == *"$ORG"* ]]
+}
+
+exec_unauthenticated() { # help output needs no credentials; make sure none are available
+  local cfg
+  cfg=$(mktemp -d "${TMPDIR:-/tmp}/gh-shim-noauth.XXXXXX") || die "mktemp failed"
+  exec env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+    GH_CONFIG_DIR="$cfg" GH_PROMPT_DISABLED=1 "$REAL" "$@"
+}
+
+pr_create() {
+  local -a args=("$@")
+  local n=$# i a s j c v repo_set=0 repo_flag="" help=0 web=0 dd=0 seen_sub=0
+  for ((i = 1; i < n; i++)); do
+    a=${args[i]}
+    ((dd)) && continue
+    if ((!seen_sub)) && [[ $a == create || $a == new ]]; then
+      seen_sub=1
+      continue
+    fi
+    case $a in
+      --) dd=1 ;;
+      --help) help=1 ;;
+      --web) web=1 ;;
+      --repo)
+        repo_flag=${args[i + 1]:-}
+        repo_set=1
+        i=$((i + 1))
+        ;;
+      --repo=*)
+        repo_flag=${a#--repo=}
+        repo_set=1
+        ;;
+      --assignee | --base | --body | --body-file | --head | --label | --milestone | --project | --reviewer | --title | --template | --recover)
+        i=$((i + 1))
+        ;;
+      --*) ;;
+      -?*)
+        s=${a#-}
+        for ((j = 0; j < ${#s}; j++)); do
+          c=${s:j:1}
+          case $c in
+            R)
+              v=${s:j+1}
+              v=${v#=}
+              if [[ -z $v ]]; then
+                v=${args[i + 1]:-}
+                i=$((i + 1))
+              fi
+              repo_flag=$v
+              repo_set=1
+              break
+              ;;
+            a | B | b | F | H | l | m | p | r | t | T)
+              [[ -z ${s:j+1} ]] && i=$((i + 1))
+              break
+              ;;
+            w) web=1 ;;
+            h) help=1 ;;
+          esac
+        done
+        ;;
+    esac
+  done
+
+  ((help)) && exec_unauthenticated "$@"
+
+  local signal=0 cwd_orin=0 target=""
+  mentions_org "$@" && signal=1
+  if local_orin; then
+    signal=1
+    cwd_orin=1
+  fi
+  if ((repo_set)); then
+    target=$repo_flag
+  elif [[ -n ${GH_REPO:-} ]]; then
+    target=$GH_REPO
+  else
+    # Canonical owner/name of the checkout (follows org renames). Read-only, your own login.
+    target=$(env -u GH_REPO GH_PROMPT_DISABLED=1 "$REAL" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) || target=""
+    [[ -z $target && $cwd_orin == 1 ]] && target="$ORG/$LOCAL_NAME"
+  fi
+  if [[ -n $target ]] && parse_repo "$target" && is_org; then signal=1; fi
+
+  # Not orin-dx anywhere: your own PR, your own login.
+  ((signal)) || exec "$REAL" "$@"
+
+  # From here on the shim never uses your credentials.
+  ((web)) && die "--web would open the PR in your browser as you; drop --web and the shim opens it as orin-dx-pr-bot."
+  [[ -n $target ]] || die "cannot tell which orin-dx repo this PR is for; pass -R $ORG/<repo>."
+  parse_repo "$target" || die "cannot parse the repository '$target'; pass -R $ORG/<repo>."
+  is_org || die "this checkout or command involves $ORG but the PR target is $R_OWNER/$R_NAME. Refusing to open it with your own credentials; run it from outside the $ORG checkout."
+  [[ $R_HOST == github.com ]] || die "$ORG PRs must target github.com (got $R_HOST)."
+  [[ $R_NAME =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid repository name '$R_NAME'."
+
+  local mint="$HOME_DIR/.config/orin-dx/pr-bot-token" st token
+  [[ -f $mint && -x $mint ]] || die "the mint script $mint is missing; refusing to open a PR in $ORG/$R_NAME with your own credentials."
+  st=$(stat -f '%u %Lp' "$mint") || die "cannot stat $mint"
+  [[ ${st%% *} == "$(id -u)" ]] || die "$mint is not owned by you; refusing."
+  ((((8#${st##* }) & 8#022) == 0)) || die "$mint is group/world writable; refusing."
+
+  # env -i: no GH_REAL / PR_BOT_HELPER / PR_BOT_CACHE / PATH from the caller reach the mint.
+  token=$(env -i HOME="$HOME_DIR" USER="$USER_NAME" LOGNAME="$USER_NAME" PATH="$SAFE_PATH" \
+    TMPDIR="${TMPDIR:-/tmp}" "$mint" "$R_NAME" </dev/null) \
+    || die "could not mint an orin-dx-pr-bot token; refusing to open a PR in $ORG/$R_NAME with your own credentials."
+  [[ $token =~ ^gh[sopu]_[A-Za-z0-9_]{20,}$ ]] || die "the mint did not return a GitHub token; refusing."
+
+  # Token via environment only. Drop anything that could send it elsewhere or log it.
+  exec env -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_HOST -u GH_DEBUG \
+    -u DEBUG -u GH_PATH -u GIT_DIR -u GIT_WORK_TREE \
+    GH_TOKEN="$token" GH_CONFIG_DIR="$HOME_DIR/.config/gh" "$REAL" "$@"
+}
+
+# Sourcing (tests) stops here with the functions defined.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
+
+find_real_gh || die "cannot find the real gh (/opt/homebrew/bin/gh or /usr/local/bin/gh)."
+home_dir || die "cannot determine your home directory."
+
+first=${1:-}
+if [[ $first == pr ]]; then
+  # Subcommand: first non-flag word after `pr`, skipping -R/--repo values.
+  sub=""
+  argv=("$@")
+  for ((k = 1; k < $#; k++)); do
+    case ${argv[k]} in
+      -R | --repo) k=$((k + 1)) ;;
+      -*) ;;
+      *)
+        sub=${argv[k]}
+        break
+        ;;
+    esac
+  done
+  if [[ $sub == create || $sub == new ]]; then
+    pr_create "$@"
+  fi
+  exec "$REAL" "$@"
+fi
+
+if [[ -n $first && $first != -* && $BUILTINS != *" $first "* ]]; then
+  # A gh alias or extension: it runs with your login and may expand to `pr create`.
+  if mentions_org "$@" || local_orin; then
+    die "\`gh $first\` is an alias or extension; inside $ORG use the full built-in command (\`gh pr create\` opens PRs as orin-dx-pr-bot)."
+  fi
+fi
+exec "$REAL" "$@"
